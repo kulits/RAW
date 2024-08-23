@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import torch
 import torch.nn as nn
 
@@ -164,16 +165,17 @@ class LLaVATrainer(Trainer):
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             if self.args.mm_projector_lr is not None:
                 projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
+                float_head_parameters = [name for name, _ in opt_model.named_parameters() if "float_head" in name]
                 optimizer_grouped_parameters = [
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in projector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in projector_parameters and n not in float_head_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in projector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in projector_parameters and n not in float_head_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
                     },
@@ -192,6 +194,23 @@ class LLaVATrainer(Trainer):
                         "lr": self.args.mm_projector_lr,
                     },
                 ]
+                if float_head_parameters:
+                    optimizer_grouped_parameters += [
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in float_head_parameters and p.requires_grad)
+                            ],
+                            "weight_decay": self.args.weight_decay,
+                            "lr": self.args.float_head_lr,
+                        },
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in float_head_parameters and p.requires_grad)
+                            ],
+                            "weight_decay": 0.0,
+                            "lr": self.args.float_head_lr,
+                        },
+                    ]
             else:
                 optimizer_grouped_parameters = [
                     {
@@ -249,7 +268,28 @@ class LLaVATrainer(Trainer):
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        if getattr(self.args, 'tune_mm_mlp_adapter', False):
-            pass
-        else:
-            super(LLaVATrainer, self)._save(output_dir, state_dict)
+        super()._save(output_dir=output_dir, state_dict=state_dict)
+
+        from llava.train.train import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3
+
+        output_dir = Path(output_dir)
+        output_dir = str(output_dir.parent.joinpath("extra-"+output_dir.name))
+
+        state_dict_2 = get_peft_state_maybe_zero_3(
+            self.model.named_parameters(), "none"
+        )
+        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
+            self.model.named_parameters()
+        )
+        self.model.config.save_pretrained(output_dir)
+        self.model.save_pretrained(output_dir, state_dict=state_dict_2)
+        torch.save(non_lora_state_dict, os.path.join(output_dir, 'non_lora_trainables.bin'))
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+        if logs := outputs.logs:
+            if not model.training:
+                logs = {f'eval_{k}': v for k, v in logs.items()}
+            self.log(logs)
+
+        return (loss, outputs) if return_outputs else loss

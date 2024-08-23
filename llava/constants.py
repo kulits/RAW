@@ -11,3 +11,6 @@ DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
 IMAGE_PLACEHOLDER = "<image-placeholder>"
+
+FLOAT_TOKEN = "\u6570"  # 30354 数
+FLOAT_TOKEN_ID = 30354

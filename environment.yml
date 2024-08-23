@@ -1,0 +1,31 @@
+name: igllm
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+dependencies:
+  - python
+  - pip
+  - git
+  - accelerate
+  - deepspeed
+  - einops
+  - fastapi
+  - gradio
+  - ipykernel
+  - numpy
+  - pandas
+  - pytorch::pytorch
+  - pytorch::pytorch-cuda=12.1
+  - requests
+  - scipy
+  - sentencepiece
+  - tqdm
+  - transformers
+  - uvicorn
+  - wandb
+  - xformers::xformers
+  - pip:
+    - bitsandbytes
+    - peft
+    - sglang[all]
