@@ -28,14 +28,11 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
-from llava.constants import FLOAT_TOKEN_ID, FLOAT_TOKEN
-from llava.model.language_model.float_utils import get_float_head
-
+from llava.constants import ROTATION_TOKEN_ID, APPEARANCE_TOKEN_ID
+from llava.model.language_model.head_utils import get_rotation_head, get_appearance_head, symmetric_orthogonalization, W_ROTATION_MSE, W_APPEARANCE_NORM, W_APPEARANCE_COSINE
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
-    float_head_type: Optional[str] = None
-    float_w: float = 1.0
 
 
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
@@ -47,7 +44,8 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
 @dataclass
 class FloatsCausalLMOutputWithPast(CausalLMOutputWithPast):
-    floats_pred: Optional[Tuple[torch.FloatTensor]] = None
+    rotations_pred: Optional[Tuple[torch.FloatTensor]] = None
+    appearances_pred: Optional[Tuple[torch.FloatTensor]] = None
     logs: Optional[Dict[str, float]] = None
 
 
@@ -60,7 +58,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.float_head = get_float_head(config)
+        self.rotation_head = get_rotation_head(config)
+        self.appearance_head = get_appearance_head(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -82,7 +81,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-        floats: Optional[torch.FloatTensor] = None,
+        rotations: Optional[torch.FloatTensor] = None,
+        appearances: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, FloatsCausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -133,6 +133,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         logs = {}
         loss = None
+        rotations_pred = None
+        appearances_pred = None
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
@@ -146,24 +148,36 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             loss = loss_fct(shift_logits, shift_labels)
             logs["next_token_loss"] = loss.detach().item()
 
-        floats_pred = None
-        if self.float_head is not None and floats is not None:
-            floats_pred_all = self.float_head(hidden_states)[:, :-1, 0]
-            floats_mask = labels[:, 1:] == FLOAT_TOKEN_ID  # 数
-            floats_pred = floats_pred_all[floats_mask.to(floats_pred_all.device)]
+            rotations_pred_all = self.rotation_head(hidden_states)[:, :-1, :]
+            rotations_mask = labels[:, 1:] == ROTATION_TOKEN_ID
+            rotations_pred = rotations_pred_all[rotations_mask.to(rotations_pred_all.device)]
+            rotations_pred = rotations_pred.reshape(-1, rotations_pred.shape[-1]).float()
+            rotations_pred = symmetric_orthogonalization(rotations_pred)
 
-            if torch.is_tensor(floats) and torch.numel(floats):
-                float_mse = torch.nn.functional.mse_loss(floats_pred, floats)
-                loss += float_mse * self.config.float_w
-                logs["float_mse_loss"] = float_mse.detach().item()
+            appearances_pred_all = self.appearance_head(hidden_states)[:, :-1, :]
+            appearances_mask = labels[:, 1:] == APPEARANCE_TOKEN_ID
+            appearances_pred = appearances_pred_all[appearances_mask.to(appearances_pred_all.device)]
+            appearances_pred = appearances_pred.reshape(-1, appearances_pred.shape[-1]).float()
 
-                for k, v in self.float_head.named_parameters():  # Sanity check to watch weights update
-                    abs_sum = v.detach().abs().float().sum().item()
-                    logs[f"abs_sum_{k}"] = abs_sum
-                    logs[f"hash_{k}"] = hash(str(abs_sum)) / sys.maxsize
+            if rotations is not None:
+                rotations = rotations.reshape(*rotations_pred.shape).float()
+                rotations = symmetric_orthogonalization(rotations)
+                rotation_mse_loss = torch.nn.functional.mse_loss(rotations_pred, rotations)
+                loss += rotation_mse_loss * W_ROTATION_MSE
+                logs["rotation_mse_loss"] = rotation_mse_loss.detach().item()
+
+            if appearances is not None:
+                appearances = appearances.reshape(*appearances_pred.shape).float()
+                appearance_norm_loss = (1 - torch.linalg.vector_norm(appearances_pred, dim=-1, ord=2)).square().mean()
+                loss += appearance_norm_loss * W_APPEARANCE_NORM
+                logs["appearance_norm_loss"] = appearance_norm_loss.detach().item()
+
+                appearance_cosine_loss = 1 - torch.nn.functional.cosine_similarity(appearances_pred, appearances).mean()
+                loss += appearance_cosine_loss * W_APPEARANCE_COSINE
+                logs["appearance_cosine_loss"] = appearance_cosine_loss.detach().item()
 
         if not return_dict:
-            output = (logits,) + outputs[1:] + (floats_pred,)
+            output = (logits,) + outputs[1:] + (rotations_pred, appearances_pred, logs)
             return (loss,) + output if loss is not None else output
 
         return FloatsCausalLMOutputWithPast(
@@ -172,7 +186,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            floats_pred=floats_pred,
+            rotations_pred=rotations_pred,
+            appearances_pred=appearances_pred,
             logs=logs,
         )
 
@@ -182,8 +197,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
-        *,
-        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -220,35 +233,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             **kwargs
         )
 
-        if (output_ids == FLOAT_TOKEN_ID).any():  # 数
-            assert (
-                tokenizer is not None
-            ), "Need `tokenizer` in `generate` if substituting floats"
-
+        if (output_ids == ROTATION_TOKEN_ID).any() or (output_ids == APPEARANCE_TOKEN_ID).any():
             inputs = torch.cat([inputs_copy, output_ids[:, 1:]], dim=1)
-
-            output_ids = torch.tensor(
-                [
-                    tokenizer(
-                        tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-                        .replace(FLOAT_TOKEN, "{:.3f}")
-                        .format(
-                            *self(
-                                input_ids=inputs,
-                                labels=inputs,
-                                attention_mask=None,
-                                images=images,
-                                floats=True,
-                            )
-                            .floats_pred.cpu()
-                            .tolist()
-                        )
-                    ).input_ids
-                ],
-                device=output_ids.device,
+            output = self(
+                input_ids=inputs,
+                labels=inputs,
+                attention_mask=None,
+                images=images,
+                floats=True,
             )
-
-        return output_ids
+            return output_ids, output.rotations_pred, output.appearances_pred
+        return output_ids, torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
                                       inputs_embeds=None, **kwargs):

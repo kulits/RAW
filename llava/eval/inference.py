@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import os
 from pathlib import Path
 
@@ -12,7 +13,6 @@ from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from PIL import Image, UnidentifiedImageError
-from llava.train.train import draw_dot
 
 
 def main(args):
@@ -29,22 +29,16 @@ def main(args):
     answers = {}
     for image_path in tqdm.tqdm(
         sorted(Path(args.image_folder).rglob("*"))
-        if not args.is_2d
-        else np.load("data/2d.npz")["random"]
     ):
-        if args.is_2d:
-            x, y = image_path
-            image = draw_dot(x, y).convert("RGB")
-        else:
-            try:
-                image = Image.open(image_path)
-            except (IsADirectoryError, UnidentifiedImageError):
-                continue
+        try:
+            image = Image.open(image_path)
+        except (IsADirectoryError, UnidentifiedImageError):
+            continue
 
         conv = conv_templates[args.conv_mode].copy()
         conv.append_message(
             conv.roles[0],
-            "<image>\nWhat Python Blender code could be used to produce the scene?",
+            "<image>",
         )
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
@@ -85,16 +79,15 @@ def main(args):
             ][0]
 
         with torch.inference_mode():
-            output_ids = model.generate(
+            output_ids, rotations, appearances = model.generate(
                 input_ids,
                 images=image_tensor.unsqueeze(0).half().cuda(),
                 do_sample=False,
                 temperature=0,
                 top_p=None,
                 num_beams=args.num_beams,
-                max_new_tokens=1024,
+                max_new_tokens=2048,
                 use_cache=True,
-                tokenizer=tokenizer,
                 bad_words_ids=tokenizer(
                     [
                         "(\n",
@@ -110,17 +103,21 @@ def main(args):
 
         answers[f"{image_path}"] = {
             "outputs": outputs,
+            "rotations": rotations.tolist() if rotations is not None else None,
+            "appearances": appearances.tolist() if appearances is not None else None,
         }
 
     Path(args.out_path).write_bytes(
-        orjson.dumps(
-            {
-                "model_path": args.model_path,
-                "model_base": args.model_base,
-                "model_name": args.model_name,
-                "answers": answers,
-            },
-            option=orjson.OPT_SERIALIZE_NUMPY,
+        gzip.compress(
+            orjson.dumps(
+                {
+                    "model_path": args.model_path,
+                    "model_base": args.model_base,
+                    "model_name": args.model_name,
+                    "answers": answers,
+                },
+                option=orjson.OPT_SERIALIZE_NUMPY,
+            )
         )
     )
 
@@ -134,7 +131,6 @@ if __name__ == "__main__":
     parser.add_argument("--out_path", type=str)
     parser.add_argument("--conv_mode", type=str, default="llava_v1")
     parser.add_argument("--image_aspect_ratio", type=str, default="square")
-    parser.add_argument("--is_2d", default=0, type=int)
     parser.add_argument("--num_beams", default=1, type=int)
     parser.add_argument("--device", default="cuda:0", type=str)
     args = parser.parse_args()

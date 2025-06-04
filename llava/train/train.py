@@ -17,20 +17,19 @@
 import os
 import copy
 from dataclasses import dataclass, field
-import itertools
-import json
 import logging
-import math
-import random
+import orjson
 from pathlib import Path
-from typing import Dict, Optional, Sequence, List
+from typing import Dict, Optional, Sequence
+import pandas as pd
+import gzip
 
 import torch
 
 import transformers
 import tokenizers
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, FLOAT_TOKEN
+from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, ROTATION_TOKEN, APPEARANCE_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -38,10 +37,13 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
-from PIL import Image, ImageDraw
-from scipy.spatial.transform import Rotation as R
+from PIL import Image
 import numpy as np
 
+HEADS = [
+    "rotation_head",
+    "appearance_head",
+]
 
 local_rank = None
 
@@ -69,25 +71,31 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
-    float_head_type: Optional[str] = field(default=None)
-    float_w: float = field(default=1.0)
 
 
 @dataclass
 class DataArguments:
     data_path: str = field(default=None,
                            metadata={"help": "Path to the training data."})
+    emb_path: Optional[str] = field(default=None)
+    floor_emb_path: Optional[str] = field(default=None)
+    env_params_path: Optional[str] = field(default=None)
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
-    data_path_val: Optional[str] = field(default=None)
-    image_folder_val: Optional[str] = field(default=None)
-    use_synonyms: bool = field(default=True)
-    shuffle_attributes: bool = field(default=True)
-    num_samples: Optional[int] = field(default=None)
-    is_2d: bool = field(default=False)
-    rotation_rep: Optional[str] = field(default=None)
+    image_grid_pinpoints: Optional[str] = field(default=None)
+    appearance_dim: int = 1024
+    curriculum: int = 0
+    use_pixel_count: int = 1
+    use_height: int = 1
+    eval_num_objects: int = 20
+    text_retrieve: int = 0
+    num_images: Optional[int] = field(default=None)
+    fuzz_env_params: Optional[int] = field(default=None)
+    no_env: Optional[int] = field(default=None)
+    use_qualified_add: Optional[int] = 1
+    no_float: Optional[int] = 0
 
 
 @dataclass
@@ -188,7 +196,7 @@ def find_all_linear_names(model):
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
-        if isinstance(module, cls) and 'float_head' not in name:
+        if isinstance(module, cls) and not any(head in name for head in HEADS):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
@@ -670,27 +678,6 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
-def get_synonym_clevr(n):  # From Johnson et al. (2017)
-    return random.choice(
-        {
-            "sphere": ["sphere", "ball"],
-            "cube": ["cube", "block"],
-            "large": ["large", "big"],
-            "small": ["small", "tiny"],
-            "metal": ["metallic", "metal", "shiny"],
-            "rubber": ["rubber", "matte"],
-        }.get(n, [n])
-    )
-
-
-def draw_dot(x, y, width=336, height=336, r=5) -> Image.Image:
-    x *= width
-    y *= height
-    image = Image.new("RGB", (width, height), color=(255, 255, 255))
-    ImageDraw.Draw(image).ellipse([(x - r, y - r), (x + r, y + r)], fill="red")
-    return image
-
-
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -708,161 +695,134 @@ class LazySupervisedDataset(Dataset):
             data_path = data_args.data_path_val
             self.image_folder = data_args.image_folder_val
 
-        if data_args.is_2d:
-            list_data_dict = np.load('data/2d.npz')[data_path]
-        else:
-            list_data_dict = json.loads(Path(data_path).read_bytes())
-            if 'scenes' in list_data_dict:
-                list_data_dict = list_data_dict['scenes']
+        emb_path = data_args.emb_path
+        floor_emb_path = data_args.floor_emb_path
+        env_params_path = data_args.env_params_path
+        self.data = pd.read_feather(data_path)['gzipped'].values.tolist()
+        self.emb = dict(np.load(emb_path))
+        self.floor_emb = dict(np.load(floor_emb_path))
+        self.floor_emb['prefix'] = self.floor_emb['labels'].tolist()
+        self.emb_params = dict(np.load(env_params_path))
+        self.emb_params['prefix'] = self.emb_params['prefix'].tolist()
 
-        if data_args.num_samples:
-            list_data_dict = list_data_dict[:data_args.num_samples]
+        if train:
+            if data_args.num_images is not None and data_args.num_images > 0:
+                self.data = self.data[:data_args.num_images]
+        else:
+            self.num_objects = data_args.eval_num_objects
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.list_data_dict = list_data_dict
-        self.data_args = data_args
-
-        if data_args.use_synonyms:
-            self.synonym_f = get_synonym_clevr
-        else:
-            self.synonym_f = lambda x: x
+        self.data_args = copy.deepcopy(data_args)
+        self.train = train
 
     def __len__(self):
-        return len(self.list_data_dict)
+        return len(self.data)
 
     @property
     def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
-        return length_list
+        return NotImplemented
 
     @property
     def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'image' in sample else -cur_len
-            length_list.append(cur_len)
-        return length_list
-    
-    def prep_code(self, entry):
+        return NotImplemented
+
+    def prep_code(self, entry, num_objects=None):
         code = ""
-        floats = []
+        rotations = []
+        appearances = []
 
-        for obj in sorted(entry["objects"], key=lambda x: x["pixel_coords"][0]):
-            attrs = []
-            if "size" in obj:
-                attrs.append(("size='{}'".format(self.synonym_f(obj["size"])), []))
-            if "color" in obj:
-                attrs.append(("color='{}'".format(self.synonym_f(obj["color"])), []))
-            if "material" in obj:
-                attrs.append(
-                    ("material='{}'".format(self.synonym_f(obj["material"])), [])
-                )
-            if "shape" in obj:
-                attrs.append(("shape='{}'".format(self.synonym_f(obj["shape"])), []))
-            if "3d_coords" in obj:
-                attrs.append(
-                    (
-                        f"loc=({FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN})",
-                        obj["3d_coords"][:],
-                    )
-                )
-            if "rotation" in obj and obj.get("shape") not in {"cylinder", "sphere"}:
-                rotation = obj["rotation"]
-                if obj.get("shape") == "cube":  # Convert degrees to radians and modulo
-                    rotation = 2 * math.pi * (rotation % 90 - 45) / 360
-                if self.data_args.rotation_rep != None:
-                    if self.data_args.rotation_rep == "6d":
-                        attrs.append(
-                            (
-                                f"rotation=({FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN})",
-                                R.from_euler("xyz", rotation).as_matrix()[:2].flatten().tolist()
-                            )
-                        )
-                    elif self.data_args.rotation_rep == "euler":
-                        attrs.append(
-                            (
-                                f"rotation=({FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN})",
-                                rotation,
-                            )
-                        )
-                    elif self.data_args.rotation_rep == "euler_int":
-                        attrs.append(
-                            (
-                                f"rotation=({FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN})",
-                                R.from_euler("xyz", rotation).as_euler("XYZ").tolist(),
-                            )
-                        )
-                    elif self.data_args.rotation_rep == "aa":
-                        attrs.append(
-                            (
-                                f"rotation=({FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN})",
-                                R.from_euler("xyz", rotation).as_rotvec().tolist(),
-                            )
-                        )
-                    elif self.data_args.rotation_rep == "quat":
-                        attrs.append(
-                            (
-                                f"rotation=({FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN}, {FLOAT_TOKEN})",
-                                R.from_euler("xyz", rotation).as_quat().tolist(),
-                            )
-                        )
-                    else:
-                        raise NotImplementedError(
-                            f"Unknown rotation type {self.data_args.rotation_rep}"
-                        )
-                else:
-                    attrs.append((f"rotation={FLOAT_TOKEN}", [rotation]))
-            if self.data_args.shuffle_attributes:
-                random.shuffle(attrs)
-            floats += list(itertools.chain(*[n[1] for n in attrs]))
-            code += "add(" + ", ".join([n[0] for n in attrs]) + ")\n"
-
-        if self.data_args.is_float:
-            return code, floats
-
-        code = code.replace(FLOAT_TOKEN, "{:+.3f}").format(*floats)
-
-        return code, []
-
-    def __getitem__(self, i, return_raw=False) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
-        has_image = True
-        if self.data_args.is_2d:
-            x, y = sources
-            if self.data_args.is_float:
-                if not self.data_args.shuffle_attributes or random.random() < 0.5:
-                    floats = [x, y]
-                    code = f'add(x={FLOAT_TOKEN}, y={FLOAT_TOKEN})\n'
-                else:
-                    floats = [y, x]
-                    code = f'add(y={FLOAT_TOKEN}, x={FLOAT_TOKEN})\n'
-            else:
-                floats = []
-                if not self.data_args.shuffle_attributes or random.random() < 0.5:
-                    code = f'add(x={x:.3f}, y={y:.3f})\n'
-                else:
-                    code = f'add(y={y:.3f}, x={x:.3f})\n'
-            image_name = f'{i}.png'
+        i = self.emb_params['prefix'].index(entry['prefix'])
+        env_params = {
+            k: self.emb_params[k][i] for k in self.emb_params if k != 'prefix'
+        }
+        if self.data_args.fuzz_env_params:
+            f = lambda x: x * (0.995 + np.random.random() * 0.010)
         else:
-            code, floats = self.prep_code(sources)
-            image_name = sources['image_filename']
+            f = lambda x: x
+
+        attr_lines = [
+            f"set_sun_size({f(env_params['sun_size']*100):.3f})",
+            f"set_sun_intensity({f(env_params['sun_intensity']):.3f})",
+            f"set_sun_elevation({f(env_params['sun_elevation']):.3f})",
+            f"set_sun_rotation({f((360 + env_params['sun_rotation'] + entry['camera_yaw'] * 180 / np.pi) % 360):.3f})",
+            f"set_air({f(env_params['air']):.3f})",
+            f"set_dust({f(env_params['dust']):.3f})",
+            f"set_ozone({f(env_params['ozone']):.3f})",
+            f"set_strength({f(env_params['strength']):.3f})",
+            f"set_density({f(env_params['density']*180):.3f})",
+            f"set_camera({f(entry['camera_pitch']*180/np.pi):.3f})",
+        ]
+        if self.data_args.text_retrieve:
+            attr_lines.append(f"set_floor({self.floor_emb['prefix'].index(entry['prefix'])})")
+        else:
+            attr_lines.append(f"set_floor({APPEARANCE_TOKEN})")
+            appearances.append(self.floor_emb['vectors'][self.floor_emb['prefix'].index(entry['prefix'])].tolist())
+        if self.data_args.no_env:
+            attr_lines = attr_lines[-1:]
+
+        np.random.shuffle(attr_lines)
+        code += "\n".join(attr_lines) + "\n"
+
+        objects = entry["objects"]
+        if num_objects is not None:
+            objects = objects[:num_objects]
+
+        factory_type_to_id = {
+            "bird": 0,
+            "boulder": 1,
+            "bush": 2,
+            "carnivore": 3,
+            "herbivore": 4,
+            "tree": 5,
+        }
+
+        for obj in objects:
+            factory_type = obj["name"].split("(")[0][:-len("Factory")].lower()
+
+            if self.data_args.use_qualified_add:
+                code += f"add_{factory_type.lower()}("
+            else:
+                code += "add("
+
+            if self.data_args.use_pixel_count:
+                code += f"pixels={obj['pixel_count']}, "
+
+            rotations.append(np.stack(obj["rotation"]).tolist())
+            code += "loc=({:.3f}, {:.3f}, {:.3f}), ".format(*obj["position"])
+            code += "height={:.3f}, ".format(obj["height"])
+            code += f"rotation={ROTATION_TOKEN}, "
+
+            if self.data_args.text_retrieve:
+                asset_id = int(np.random.RandomState(0).permutation(432000)[int(obj['emb_i']) + 72*1000*factory_type_to_id[factory_type]])
+                code += f"appearance={asset_id})\n"
+            else:
+                code += f"appearance={APPEARANCE_TOKEN})\n"
+                appearances.append(
+                    self.emb[factory_type.capitalize()+"Factory"][obj["emb_i"]].tolist()
+                )
+
+        return code, rotations, appearances
+
+    def __getitem__(self, i, return_raw=False, num_objects=20) -> Dict[str, torch.Tensor]:
+        i = int(i)
+        row = self.data[i]
+        row = orjson.loads(gzip.decompress(row))
+        has_image = True
+        if len(row["objects"]) == 0:
+            return self.__getitem__(i+1, return_raw=return_raw, num_objects=num_objects)
+        code, rotations, appearances = self.prep_code(row, num_objects=num_objects)
         sources = {
             "id": i,
-            "image": image_name,
+            "image": row["image_id"],
             "conversations": [
                 {
                     "from": "human",
-                    "value": "<image>\nWhat Python Blender code could be used to produce the scene?",
+                    "value": "<image>",
                 },
                 {
                     "from": "gpt",
-                    "value": f"The scene can be produced with:\n```python\n{code}```",
-                    "floats": floats
+                    "value": code,
                 }
             ]
         }
@@ -874,10 +834,7 @@ class LazySupervisedDataset(Dataset):
             image_file = sources[0]['image']
             image_folder = self.image_folder
             processor = self.data_args.image_processor
-            if self.data_args.is_2d:
-                image = draw_dot(x, y).convert('RGB')
-            else:
-                image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -916,8 +873,11 @@ class LazySupervisedDataset(Dataset):
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
 
-        if 'floats' in sources[0][-1]:
-            data_dict['floats'] = sources[0][-1]['floats']
+        if len(rotations):
+            data_dict['rotations'] = np.concatenate(rotations, axis=0).flatten()
+
+        if not self.data_args.text_retrieve:
+            data_dict['appearances'] = np.concatenate(appearances, axis=0).flatten()
 
         if return_raw:
             data_dict['conversations'] = conversations
@@ -956,8 +916,15 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch['images'] = images
 
-        if "floats" in instances[0]:
-            batch["floats"] = torch.tensor([n for instance in instances for n in instance["floats"]])
+        if 'rotations' in instances[0]:
+            batch['rotations'] = torch.tensor(torch.tensor(
+                np.concatenate([instance['rotations'] for instance in instances], axis=0)
+            ).flatten().numpy()).flatten().double()
+
+        if 'appearances' in instances[0]:
+            batch['appearances'] = torch.tensor(torch.tensor(
+                np.concatenate([instance['appearances'] for instance in instances], axis=0)
+            ).flatten().numpy()).flatten().double()
 
         return batch
 
@@ -988,7 +955,6 @@ def train(attn_implementation=None):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-    data_args.is_float = model_args.float_head_type.lower() != "none"
 
     bnb_model_from_pretrained_args = {
         'device_map': {"": training_args.device},
@@ -1025,8 +991,7 @@ def train(attn_implementation=None):
             )
         else:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
-            config.float_head_type = model_args.float_head_type
-            config.float_w = model_args.float_w
+            config.appearance_dim = data_args.appearance_dim
 
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1167,13 +1132,16 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
 
-    if model.float_head is not None:
-        for p in model.float_head.parameters():
+    for p in model.rotation_head.parameters():
+        p.requires_grad = True
+    if model.appearance_head is not None:
+        for p in model.appearance_head.parameters():
             p.requires_grad = True
     if local_rank in {-1, 0}:
-        print('train_dataset', data_module['train_dataset'].__getitem__(0, return_raw=True))
-        if data_module['eval_dataset']:
-            print('eval_dataset', data_module['eval_dataset'].__getitem__(0, return_raw=True))
+        entry = data_module['train_dataset'].__getitem__(0, return_raw=True)
+        print('train_dataset', entry['conversations'], f'{entry["rotations"].shape=} {entry.get("appearances", np.zeros(1)).shape=}')
+        entry = data_module['eval_dataset'].__getitem__(0, return_raw=True)
+        print('eval_dataset', entry['conversations'], f'{entry["rotations"].shape=} {entry.get("appearances", np.zeros(1)).shape=}')
         print(f'{get_peft_state_non_lora_maybe_zero_3(model.named_parameters()).keys()=}')
 
     trainer = LLaVATrainer(model=model,

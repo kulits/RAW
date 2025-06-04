@@ -39,14 +39,13 @@ You acknowledge that the Data & Software is a valuable scientific resource and a
 
 Citation:
 ```
-@article{
-  kulits2024rethinking,
-  title={Re-Thinking Inverse Graphics With Large Language Models},
-  author={Peter Kulits and Haiwen Feng and Weiyang Liu and Victoria Fernandez Abrevaya and Michael J. Black},
-  journal={Transactions on Machine Learning Research},
-  issn={2835-8856},
-  year={2024},
-  url={https://openreview.net/forum?id=u0eiu1MTS7},
+@InProceedings{kulits2025raw,
+    author    = {Kulits, Peter and Black, Michael J. and Zuffi, Silvia},
+    title     = {Reconstructing Animals and the Wild},
+    booktitle = {CVPR},
+    month     = {June},
+    year      = {2025},
+    pages     = {16565--16577}
 }
 ```
 

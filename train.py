@@ -13,11 +13,12 @@ prompt_version = "v1"
 model_version = "336px-pretrain-vicuna-7b-v1.3"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--images_tar", type=str)
-parser.add_argument("--images_val_tar", type=str)
+parser.add_argument("--images_tar", type=str, required=True)
+parser.add_argument("--images_val_tar", type=str, required=True)
 parser.add_argument("--data_path", type=str, required=True)
 parser.add_argument("--data_path_val", type=str)
 parser.add_argument("--output_dir", type=str, required=True)
+parser.add_argument("--emb_path", type=str, required=True)
 parser.add_argument("--deepspeed", default="./scripts/zero2.json", type=str)
 parser.add_argument("--lora_enable", default=True, type=bool)
 parser.add_argument("--lora_r", default=128, type=int)
@@ -56,39 +57,55 @@ parser.add_argument("--gradient_checkpointing", default=True, type=bool)
 parser.add_argument("--lazy_preprocess", default=True, type=bool)
 parser.add_argument("--dataloader_num_workers", default=20, type=int)
 parser.add_argument("--report_to", default="wandb", type=str)
-parser.add_argument("--shuffle_attributes", default=None, type=eval)
-parser.add_argument("--float_head_type", default="none", type=str)
 parser.add_argument("--evaluation_strategy", default="steps", type=str)
-parser.add_argument("--use_synonyms", default=True, type=bool)
 parser.add_argument("--eval_steps", default=100, type=int)
-parser.add_argument("--rotation_rep", type=str)
 parser.add_argument("--mm_projector_type", type=str)
 parser.add_argument("--image_aspect_ratio", default="square", type=str)
-parser.add_argument("--is_2d", default=False, type=bool)
-parser.add_argument("--num_samples", type=int)
-parser.add_argument("--float_w", type=float)
+parser.add_argument("--num_samples", default=-1, type=int)
+parser.add_argument("--appearance_dim", default=1024, type=int)
+parser.add_argument("--use_height", default=1, type=int)
+parser.add_argument("--use_prompt", default=1, type=int)
+parser.add_argument("--eval_num_objects", default=5, type=int)
+parser.add_argument("--text_retrieve", default=0, type=int)
+parser.add_argument("--fuzz_env_params", default=0, type=int)
+parser.add_argument("--no_env", default=0, type=int)
+parser.add_argument("--use_qualified_add", default=1, type=int)
+parser.add_argument("--use_pixel_count", default=1, type=int)
 
 args = parser.parse_args()
 
-assert args.is_2d or args.images_tar is not None, args.images_tar
-assert args.is_2d or Path(args.images_tar).exists(), args.images_tar
-assert args.is_2d or Path(args.data_path).exists(), args.data_path
+assert Path(args.images_tar).exists()
+assert Path(args.images_val_tar).exists()
 
-if not args.is_2d:
-    Path("/tmp/images").mkdir()
-    run(["tar", "xf", args.images_tar, "-C", "/tmp/images/"], check=True)
-    run(["rsync", "-a", args.data_path, "/tmp/train.json"], check=True)
-    args.data_path = "/tmp/train.json"
+Path("/tmp/images").mkdir(exist_ok=True)
+Path("/tmp/images-val").mkdir(exist_ok=True)
 
-    if args.images_val_tar:
-        assert Path(args.images_val_tar).exists(), args.images_val_tar
-        assert Path(args.data_path_val).exists(), args.data_path_val
-        Path("/tmp/images_val").mkdir()
-        run(["tar", "xf", args.images_val_tar, "-C", "/tmp/images_val/"], check=True)
-        run(["rsync", "-a", args.data_path_val, "/tmp/val.json"], check=True)
-        args.data_path_val = "/tmp/val.json"
-    else:
-        print("No images_val_tar passed.")
+run(["tar", "xf", args.images_tar, "-C", args.image_folder], check=True)
+run(["tar", "xf", args.images_val_tar, "-C", args.image_folder_val], check=True)
+
+if 'convnext' in args.emb_path:
+    emb_prefix = 'convnext'
+elif 'dinov2-giant' in args.emb_path:
+    emb_prefix = 'dinov2-giant'
+elif 'bioclip' in args.emb_path:
+    emb_prefix = 'bioclip'
+else:
+    raise ValueError("Unknown emb type.")
+
+run(["rsync", "-a", args.data_path, "/tmp/train.feather"], check=True)
+args.data_path = "/tmp/train.feather"
+
+run(["rsync", "-a", args.data_path_val, "/tmp/val.feather"], check=True)
+args.data_path_val = "/tmp/val.feather"
+
+run(["rsync", "-a", args.emb_path, "/tmp/emb.npz"], check=True)
+args.emb_path = "/tmp/emb.npz"
+
+run(["rsync", "-a", f"./data/floor_{emb_prefix}.npz", "/tmp/floor_emb.npz"], check=True)
+args.floor_emb_path = "/tmp/floor_emb.npz"
+
+run(["rsync", "-a", f"./data/env_params.npz", "/tmp/env_params.npz"], check=True)
+args.env_params_path = "/tmp/env_params.npz"
 
 del args.images_tar
 del args.images_val_tar
