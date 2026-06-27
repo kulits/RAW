@@ -5,7 +5,6 @@
 <p align="center">
   <a href="https://raw.is.tue.mpg.de">[Project Page]</a>
 </p>
-<p>Data and code coming soon.</p>
 <h2>Summary</h2>We train an LLM to decode a frozen CLIP embedding of a natural image into a structured compositional scene representation encompassing both animals <em>and</em> their habitats.
 <h3 style="text-align:center">
   <span>
